@@ -1,0 +1,115 @@
+#!/bin/bash
+#
+# log-start – records an interactive shell session (input + output) and
+# optionally uploads the cleaned log directly to a MediaWiki page.
+#
+# Configuration is loaded from a .env file (see .env.example) or from
+# environment variables set before invocation.
+
+set -u
+
+# --- Load configuration --------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${LOG_START_ENV:-$SCRIPT_DIR/../.env}"
+[ -f "$ENV_FILE" ] && source "$ENV_FILE"
+
+LOGDIR="${LOG_START_LOGDIR:-$HOME/logs}"
+WIKI_CONTAINER="${LOG_START_WIKI_CONTAINER:-mediawiki}"
+WIKI_PAGE="${LOG_START_WIKI_PAGE:-Logs}"
+WIKI_USER="${LOG_START_WIKI_USER:-Admin}"
+WIKI_URL="${LOG_START_WIKI_URL:-https://your-wiki.example}"
+
+if [ -z "${1:-}" ]; then
+    echo "Usage: log-start <name>"
+    exit 1
+fi
+
+mkdir -p "$LOGDIR"
+LOGFILE="$LOGDIR/$(date +%Y%m%d-%H%M)-$1.log"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Log started: $1"
+echo "  File: $LOGFILE"
+echo "  Stop with: exit"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+RCFILE=$(mktemp)
+cat > "$RCFILE" <<'RCEOF'
+source ~/.bashrc 2>/dev/null
+bind 'set enable-bracketed-paste off'
+
+nano() {
+    local target="$1"
+    local backup=""
+    if [ -f "$target" ]; then
+        backup=$(mktemp)
+        cp "$target" "$backup"
+    fi
+    command nano "$@"
+    echo ""
+    echo "┌─ FILE EDITED: $target ──────────────"
+    if [ -n "$backup" ]; then
+        diff -u "$backup" "$target"
+    else
+        echo "(new file created)"
+        cat "$target"
+    fi
+    echo "└────────────────────────────────────────"
+    echo ""
+    [ -n "$backup" ] && rm -f "$backup"
+}
+
+vim() {
+    local target="$1"
+    local backup=""
+    if [ -f "$target" ]; then
+        backup=$(mktemp)
+        cp "$target" "$backup"
+    fi
+    command vim "$@"
+    echo ""
+    echo "┌─ FILE EDITED: $target ──────────────"
+    if [ -n "$backup" ]; then
+        diff -u "$backup" "$target"
+    else
+        echo "(new file created)"
+        cat "$target"
+    fi
+    echo "└────────────────────────────────────────"
+    echo ""
+    [ -n "$backup" ] && rm -f "$backup"
+}
+RCEOF
+
+script -q -f "$LOGFILE" -c "bash --rcfile $RCFILE"
+rm -f "$RCFILE"
+
+# --- Automatically create a cleaned copy ---------------------------------
+CLEANFILE="${LOGFILE%.log}-clean.log"
+LC_ALL=C sed -E '
+s/\x1B\[[0-9;?]*[@-~]//g
+s/\x1B[()][A-Za-z0-9]//g
+s/\x1B[=>78]//g
+s/\r//g
+' "$LOGFILE" > "$CLEANFILE"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  Log finished: $1"
+echo "  Raw:          $LOGFILE"
+echo "  Cleaned:      $CLEANFILE"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+read -p "  Upload cleaned log to the wiki? (y/n): " ANSWER
+if [[ "$ANSWER" == "y" || "$ANSWER" == "Y" ]]; then
+    LOGNAME=$(basename "$LOGFILE" .log)
+    {
+        sudo docker exec "$WIKI_CONTAINER" php maintenance/run.php getText.php "$WIKI_PAGE" 2>/dev/null
+        echo ""
+        echo "== $LOGNAME =="
+        echo "<pre>"
+        cat "$CLEANFILE"
+        echo "</pre>"
+    } | sudo docker exec -i "$WIKI_CONTAINER" php maintenance/run.php edit.php \
+        --user="$WIKI_USER" --summary="Log: $LOGNAME" "$WIKI_PAGE"
+    echo "  ✓ Uploaded → $WIKI_URL/wiki/$WIKI_PAGE"
+fi
